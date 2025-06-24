@@ -3,7 +3,7 @@ import torch
 import time
 import sys
 from .. import Config, Model, Tokenizer
-from ..modules import Linear, TransformerBlock
+from ..modules import Linear
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
@@ -266,19 +266,22 @@ def mod_strategy(args, module, strategy, idx):
     return new_strategy
 
 
-def get_hessian(key, hessian_path, device):
-    import exllamav3.ext as ext
-    parts = key.split(".")
-    layer_idx = parts.index("layers") + 1
-    layer_num = int(parts[layer_idx])
-    submodule = ".".join(parts[layer_idx + 1:])
-    state = torch.load(os.path.join(hessian_path, f"l{layer_num}.pt"))
-    # Squeeze any singleton dimensions from Hessian matrix
-    if state[submodule].dim() > 2:
-        state[submodule] = state[submodule].squeeze()
+def get_hessian(key, hessian_path, device, id_row_num=None):
+    if id_row_num is not None:
+        H_data = torch.eye(id_row_num, dtype = torch.float32)
+    else:
+        parts = key.split(".")
+        layer_idx = parts.index("layers") + 1
+        layer_num = int(parts[layer_idx])
+        submodule = ".".join(parts[layer_idx + 1:])
+        state = torch.load(os.path.join(hessian_path, f"l{layer_num}.pt"))
+        # Squeeze any singleton dimensions from Hessian matrix
+        if state[submodule].dim() > 2:
+            state[submodule] = state[submodule].squeeze()
+        H_data = state[submodule]
     inf_nan = torch.zeros(2, dtype = torch.long, device = device)
     H_dict = {
-        "H": state[submodule],
+        "H": H_data,
         "finalized": False,
         "count": 1,
         "inf_nan": inf_nan,
@@ -311,7 +314,6 @@ def main(args, job_state):
     # Get initial state or resume state
     state = prepare_state(args, job_state, config, model, tokenizer)
 
-    transformer_idx = 0
     last_module_idx = len(model.modules) - 1
     # Iterate over modules
     for idx, module in enumerate(model.modules):
@@ -357,7 +359,7 @@ def main(args, job_state):
 
             # Skip modules without quant targets
             qmaps = module.get_qmaps()
-            if len(qmaps) > 0:
+            if len(qmaps) > 0 and not args.get("hessian_path"):
 
                 # Capture calibration input states during forward pass. For block-sparse models, all expert layers
                 # are activated to ensure all down projections capture at least some calibration data. When the
@@ -372,8 +374,6 @@ def main(args, job_state):
                             "capture": capture_H,
                             "activate_all_experts": model.calibration_all_experts,
                         }
-                        if args.get("hessian_path") and idx < last_module_idx:
-                            del params["capture"]
                         if slicing:
                              params["q_mlp_slice"] = current_slice
                         rs = module.prepare_for_device(state[i], params)
@@ -446,6 +446,8 @@ def main(args, job_state):
                         if args["image_dump"] else None
                     if args.get("hessian_path") and idx < last_module_idx:
                         H_dict = get_hessian(linear.key, args["hessian_path"], device)
+                    elif args.get("hessian_path") and idx == last_module_idx: # Last module is the lm head
+                        H_dict = get_hessian(linear.key, args["hessian_path"], device, id_row_num=module.in_features)
                     else:
                         H_dict = capture_H[linear.qmap]
                     proxy_err = linear.convert_exl3(
@@ -495,40 +497,41 @@ def main(args, job_state):
         del q_tensors
 
         # Advance state
-        error = 0
-        cos_error = 0
-        sqnr_ = 0
-        with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
-            for i in range(len(state)):
-                progress.update(i)
-                params = {
-                    "attn_mode": "flash_attn_nc",
-                }
-                state[i] = module.prepare_for_device(state[i], params)
-                if i < num_ref_states or idx < len(model.modules) - 1:
-                    state[i] = module.forward(state[i], params).cpu()
-                if i < num_ref_states and len(linears):
-                    ref_states[i] = ref_states[i].to(state[i].device)
-                    rfn, cos, sq = get_state_error(state[i], ref_states[i])
-                    error += rfn
-                    cos_error += cos
-                    sqnr_ += sq
-                    ref_states[i] = None
-        error /= num_ref_states
-        cos_error /= num_ref_states
-        sqnr_ /= num_ref_states
+        if not args.get("hessian_path"):
+            error = 0
+            cos_error = 0
+            sqnr_ = 0
+            with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
+                for i in range(len(state)):
+                    progress.update(i)
+                    params = {
+                        "attn_mode": "flash_attn_nc",
+                    }
+                    state[i] = module.prepare_for_device(state[i], params)
+                    if i < num_ref_states or idx < len(model.modules) - 1:
+                        state[i] = module.forward(state[i], params).cpu()
+                    if i < num_ref_states and len(linears):
+                        ref_states[i] = ref_states[i].to(state[i].device)
+                        rfn, cos, sq = get_state_error(state[i], ref_states[i])
+                        error += rfn
+                        cos_error += cos
+                        sqnr_ += sq
+                        ref_states[i] = None
+            error /= num_ref_states
+            cos_error /= num_ref_states
+            sqnr_ /= num_ref_states
 
-        # Feedback after module
-        module_time = time.time() - start_module_time
-        print(
-            f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
-            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
-            (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
-            f"  cos: {cos_error:.6f}"
-            f"  sqnr: {sqnr_:.6f}"
-            f"  [{module_time:.2f} s]"
-        )
-        sys.stdout.flush()
+            # Feedback after module
+            module_time = time.time() - start_module_time
+            print(
+                f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
+                (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
+                (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+                f"  cos: {cos_error:.6f}"
+                f"  sqnr: {sqnr_:.6f}"
+                f"  [{module_time:.2f} s]"
+            )
+            sys.stdout.flush()
         if idx >= model.first_block_idx:
             overall_time = time.time() - start_time
             timed_blocks += 1
@@ -556,8 +559,6 @@ def main(args, job_state):
             os.rename(ckpt_dir_new, ckpt_dir)
             last_checkpoint_time = time.time()
 
-        if isinstance(module, TransformerBlock):
-            transformer_idx += 1
 
     # Compile model
     compile_model(args, model, config, tokenizer)
