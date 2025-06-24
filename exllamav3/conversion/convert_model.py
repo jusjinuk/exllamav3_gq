@@ -3,7 +3,7 @@ import torch
 import time
 import sys
 from .. import Config, Model, Tokenizer
-from ..modules import Linear
+from ..modules import Linear, TransformerBlock
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
@@ -41,6 +41,7 @@ parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save 
 parser.add_argument("-mcg", "--mcg_multiplier", type = str, default = None, help = "MCG multiplier - EXPERIMENTAL, DO NOT USE")
 parser.add_argument("-mul1", "--mul1_multiplier", type = str, default = None, help = "MUL1 multiplier - EXPERIMENTAL, DO NOT USE")
 parser.add_argument("-strat", "--strategy", type = str, default = None, help = "Modifiers for quantization strategy - EXPERIMENTAL")
+parser.add_argument("-hp", "--hessian_path", type = str, default = None, help = "File path to pre-computed Hessian matrix - EXPERIMENTAL")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
@@ -156,6 +157,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("mcg_multiplier", True, ""),
         ("mul1_multiplier", True, ""),
         ("strategy", False, ""),
+        ("hessian_path", False, ""),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -189,6 +191,9 @@ def prepare(args) -> (dict, dict, bool, str):
     if in_args.get("mul1_multiplier"):
         warn_experimental = True
         print(f"    {col_red}MUL1 multiplier (experimental): {in_args.get('mul1_multiplier')} {col_default}")
+    if in_args.get("hessian_path"):
+        warn_experimental = True
+        print(f"    {col_red}Hessian path (experimental): {in_args.get('hessian_path')} {col_default}")
 
     if warn_experimental:
         print(
@@ -261,6 +266,26 @@ def mod_strategy(args, module, strategy, idx):
     return new_strategy
 
 
+def get_hessian(key, hessian_path, device):
+    import exllamav3.ext as ext
+    parts = key.split(".")
+    layer_idx = parts.index("layers") + 1
+    layer_num = int(parts[layer_idx])
+    submodule = ".".join(parts[layer_idx + 1:])
+    state = torch.load(os.path.join(hessian_path, f"l{layer_num}.pt"))
+    # Squeeze any singleton dimensions from Hessian matrix
+    if state[submodule].dim() > 2:
+        state[submodule] = state[submodule].squeeze()
+    inf_nan = torch.zeros(2, dtype = torch.long, device = device)
+    H_dict = {
+        "H": state[submodule],
+        "finalized": False,
+        "count": 1,
+        "inf_nan": inf_nan,
+        "H_swap_device": device,
+    }
+    return H_dict
+
 @torch.inference_mode()
 def main(args, job_state):
 
@@ -286,6 +311,8 @@ def main(args, job_state):
     # Get initial state or resume state
     state = prepare_state(args, job_state, config, model, tokenizer)
 
+    transformer_idx = 0
+    last_module_idx = len(model.modules) - 1
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
@@ -345,6 +372,8 @@ def main(args, job_state):
                             "capture": capture_H,
                             "activate_all_experts": model.calibration_all_experts,
                         }
+                        if args.get("hessian_path") and idx < last_module_idx:
+                            del params["capture"]
                         if slicing:
                              params["q_mlp_slice"] = current_slice
                         rs = module.prepare_for_device(state[i], params)
@@ -415,8 +444,12 @@ def main(args, job_state):
                 with Timer() as t:
                     sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
                         if args["image_dump"] else None
+                    if args.get("hessian_path") and idx < last_module_idx:
+                        H_dict = get_hessian(linear.key, args["hessian_path"], device)
+                    else:
+                        H_dict = capture_H[linear.qmap]
                     proxy_err = linear.convert_exl3(
-                        capture_H[linear.qmap],
+                        H_dict,
                         quant_args = quant_args,
                         progress_str = f" -- <step>: {linear.key}",
                         verbose = args["verbose"],
@@ -522,6 +555,9 @@ def main(args, job_state):
             os.rename(ckpt_dir, ckpt_dir_old)
             os.rename(ckpt_dir_new, ckpt_dir)
             last_checkpoint_time = time.time()
+
+        if isinstance(module, TransformerBlock):
+            transformer_idx += 1
 
     # Compile model
     compile_model(args, model, config, tokenizer)
