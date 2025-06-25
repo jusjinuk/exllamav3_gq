@@ -1,7 +1,35 @@
 
-# <img src="doc/cat.png" width="40"> ExLlamaV3
+# ExLlamaV3-GQ
 
-ExLlamaV3 is still in development. Please note: ↙
+This is a fork of ExLlamaV3 that adds support for inserting pre-computed Hessians instead of using the on-the-fly computed Hessians.
+
+The Hessian file format is compatible with [GuidedQuant](https://github.com/snu-mllab/GuidedQuant) repository.
+
+
+## Command line usage
+
+```sh
+python convert.py -i <input_dir> -o <output_dir> -w <work_dir> -b <bitrate> -hp <hessian_dir>     
+```
+
+## What I have tried
+
+I ran some toy experiments using the GuidedQuant Hessian from its original repository. Since the original paper does not have the Hessian for the lm_head, I used the Hessian for this layer to be identity (which corresponds to minimizing L2 weight difference).
+
+As a preliminary test, I applied this setup to the Llama-3.2-1B Instruct model. However, the results did not show meaningful improvement ([results](doc/llama32_1b_instruct_gq.png)).
+
+This could be due to several reasons:
+
+1. The Hessian for lm_head was set to the identity matrix, which may put the GuidedQuant method at a disadvantage compared to ExLlamaV3 quantization.
+2. The pre-computed Hessian does not account for changes in activation after quantization, which might reduce its effectiveness.
+3. The calibration dataset differ between the two methods, making the comparison less rigorous.
+
+Further investigation is needed to understand why the improvement is not as significant as expected.
+
+---
+# Original README of <img src="doc/cat.png" width="40"> ExLlamaV3
+
+ExLlamaV3-GQ is still in development. Please note: ↙
 
 - The framework <u>is not yet fully optimized</u>. Performance is lacking, especially on Ampere, and there may be a significant CPU bottleneck on slower processors until the extension functions are fully built out.
 - AMD GPUs (ROCm) are not yet supported.
